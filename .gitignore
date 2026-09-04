@@ -54,7 +54,7 @@ env/
 # Experiment data and outputs
 data/
 datasets/
-output/
+/output
 outputs/
 eval/
 results/

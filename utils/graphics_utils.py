@@ -70,6 +70,26 @@ def getProjectionMatrix(znear, zfar, fovX, fovY):
     P[2, 3] = -(zfar * znear) / (zfar - znear)
     return P
 
+def getProjectionMatrixFromIntrinsics(znear, zfar, fx, fy, cx, cy, width, height):
+    """Build the positive-Z projection used by the Gaussian rasterizer.
+
+    Unlike ``getProjectionMatrix``, this form keeps an off-center principal
+    point. Pixel coordinates follow the OpenCV convention used by OmniScene.
+    """
+    if fx <= 0 or fy <= 0 or width <= 0 or height <= 0:
+        raise ValueError("Focal lengths and image dimensions must be positive")
+
+    P = torch.zeros(4, 4)
+    z_sign = 1.0
+    P[0, 0] = 2.0 * float(fx) / float(width)
+    P[1, 1] = 2.0 * float(fy) / float(height)
+    P[0, 2] = 2.0 * float(cx) / float(width) - 1.0
+    P[1, 2] = 2.0 * float(cy) / float(height) - 1.0
+    P[3, 2] = z_sign
+    P[2, 2] = z_sign * zfar / (zfar - znear)
+    P[2, 3] = -(zfar * znear) / (zfar - znear)
+    return P
+
 def fov2focal(fov, pixels):
     return pixels / (2 * math.tan(fov / 2))
 

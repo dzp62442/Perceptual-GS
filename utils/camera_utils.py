@@ -53,10 +53,18 @@ def loadCam(args, id, cam_info, resolution_scale):
         resized_alpha_rgb = PILtoTorch(cam_info.alpha, resolution)
         gt_alpha = resized_alpha_rgb[:3, ...]
 
+    scale_x = float(resolution[0]) / float(orig_w)
+    scale_y = float(resolution[1]) / float(orig_h)
+    fx = cam_info.fx * scale_x if cam_info.fx is not None else None
+    fy = cam_info.fy * scale_y if cam_info.fy is not None else None
+    cx = cam_info.cx * scale_x if cam_info.cx is not None else None
+    cy = cam_info.cy * scale_y if cam_info.cy is not None else None
+
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, sens=gt_sens, alpha=gt_alpha, data_device=args.data_device)
+                  image_name=cam_info.image_name, uid=id, sens=gt_sens, alpha=gt_alpha,
+                  fx=fx, fy=fy, cx=cx, cy=cy, data_device=args.data_device)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
@@ -83,7 +91,9 @@ def camera_to_JSON(id, camera : Camera):
         'height' : camera.height,
         'position': pos.tolist(),
         'rotation': serializable_array_2d,
-        'fy' : fov2focal(camera.FovY, camera.height),
-        'fx' : fov2focal(camera.FovX, camera.width)
+        'fy' : camera.fy if camera.fy is not None else fov2focal(camera.FovY, camera.height),
+        'fx' : camera.fx if camera.fx is not None else fov2focal(camera.FovX, camera.width),
+        'cx' : camera.cx if camera.cx is not None else camera.width / 2.0,
+        'cy' : camera.cy if camera.cy is not None else camera.height / 2.0,
     }
     return camera_entry

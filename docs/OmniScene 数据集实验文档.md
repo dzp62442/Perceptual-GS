@@ -2,7 +2,7 @@
 
 ## 1. 文档目的与本阶段边界
 
-本文档描述如何在 Perceptual-GS 中接入 OmniScene，并以逐场景优化方式完成 Center150 对比实验。当前阶段只确定方案，不实现代码、不创建 Center150 子集、不启动训练。文档通过审阅后，再按本文实施。
+本文档描述 Perceptual-GS 接入 OmniScene、以逐场景优化方式完成 Center150 对比实验的设计与实现约定。方案审阅后已按本文完成代码开发和单样本小迭代冒烟；本项目仍不创建 Center150 子集，也不会自动启动正式 150 场景实验。
 
 本次适配遵循以下边界：
 
@@ -92,7 +92,7 @@ DepthSplat 在一次 forward 中预测深度、生成 Gaussian 并渲染 target�
 1. `comp_svfgs` 负责把原始 OmniScene bin 解析、校验并预处理为 3DGS 可读场景；
 2. `scripts/run_omniscene.py` 负责逐场景调用 Perceptual-GS 的训练入口，并在训练进程内完成里程碑渲染、评估和结果落盘。
 
-## 4. 计划新增和修改的文件
+## 4. 新增和修改的文件
 
 ```text
 Perceptual-GS/
@@ -109,7 +109,7 @@ Perceptual-GS/
 └── output/                        # 运行时自动创建，已由 .gitignore 忽略
 ```
 
-现有文件预计做最小范围修改：
+现有文件按最小范围修改：
 
 - `scene/dataset_readers.py`：读取逐帧 K、稳健识别 train/test 路径、正确处理 RGB 图像的 alpha，并加载 prepared PLY；
 - `scene/cameras.py`、`utils/camera_utils.py`、必要时 `utils/graphics_utils.py`：把逐帧 `fx/fy/cx/cy` 贯通到投影矩阵；
@@ -370,7 +370,7 @@ Perceptual-GS 默认 `densify_until_iter=15000`，高于本实验的 10000 上�
 
 ### 8.1 默认命令
 
-默认环境和命令规划为：
+默认环境和命令为：
 
 ```bash
 conda run -n perceptual_gs python scripts/run_omniscene.py
@@ -390,7 +390,7 @@ conda run -n perceptual_gs python scripts/run_omniscene.py
 - result root：`output/omniscene_results`；
 - 传入 Perceptual-GS 的 `-r` 恒为 `1`。
 
-计划支持的覆写示例：
+支持的覆写示例：
 
 ```bash
 conda run -n perceptual_gs python scripts/run_omniscene.py \
@@ -400,7 +400,7 @@ conda run -n perceptual_gs python scripts/run_omniscene.py \
   --gpu 0
 ```
 
-还将支持 `--data-root`、`--prepared-root`、`--result-root`、`--mode`、`--conf-threshold` 和 `--extra-train-args`。数据路径与协议控制参数不能通过 `--extra-train-args` 重复传入。评估点必须严格递增、不能重复、不能超过总迭代数，并要求最后一个评估点等于总迭代数。
+同时支持 `--data-root`、`--prepared-root`、`--result-root`、`--mode`、`--conf-threshold`、`--scene-indices` 和 `--extra-train-args`。`--scene-indices` 使用从 1 开始的清单序号，便于单样本冒烟或外部分批调度，不改变实验协议和场景结果目录。数据路径与协议控制参数不能通过 `--extra-train-args` 重复传入。评估点必须严格递增、不能重复、不能超过总迭代数，并要求最后一个评估点等于总迭代数。
 
 不同分辨率或非默认迭代协议使用不同结果目录；同一路径检测到会改变实验语义的协议变化时直接拒绝运行，不混用旧产物。这里的硬协议仅包括数据清单与数据根目录、分辨率、置信度阈值、训练/评估视角、总迭代数、评估点以及会影响结果的显式训练参数，不包括源码文件哈希、文件修改时间、Git commit、分支名称或工作区 clean/dirty 状态。若代码状态发生变化，runner 可以输出提示或把当前 Git 信息写入日志，但不得因此拒绝运行、强制重跑或把原本完整的场景判为不完整。
 
@@ -499,7 +499,7 @@ output/omniscene_results/center150_112x200/
 
 ## 10. 计划验证与验收标准
 
-实现阶段先做 CPU/静态测试，再做一个真实样本的小迭代 GPU 冒烟，最后才允许启动正式 Center150。
+实现验证先做 CPU/静态测试，再做一个真实样本的小迭代 GPU 冒烟，最后才允许启动正式 Center150。
 
 ### 10.1 数据与协议测试
 
@@ -532,7 +532,7 @@ output/omniscene_results/center150_112x200/
 
 ### 10.4 真实样本冒烟验收
 
-在用户审阅文档并授权实现后，用 Center150 的一个真实 bin 做 1～数十次迭代冒烟，确认：
+已用 Center150 第一个真实 bin 做 1 次迭代冒烟，确认：
 
 - 6 张 train 和 18 张 test 全部被正确加载；
 - 初始化点云不是随机点云；
@@ -543,9 +543,9 @@ output/omniscene_results/center150_112x200/
 
 正式 150 场景实验不在实现和冒烟通过前启动。
 
-## 11. 实施顺序
+## 11. 实施与验证顺序
 
-文档审阅通过后按以下顺序开发：
+文档审阅通过后按以下顺序完成开发与验证：
 
 1. 实现纯数据 loader 和 Center150 严格校验；
 2. 实现场景预处理、sensitivity map、Metric3D PLY 和缓存 meta；

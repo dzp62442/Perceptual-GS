@@ -12,7 +12,7 @@
 import os
 import sys
 from PIL import Image
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
     read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
 from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
@@ -40,6 +40,11 @@ class CameraInfo(NamedTuple):
     sens_name: str
 
     alpha: np.array
+
+    fx: Optional[float] = None
+    fy: Optional[float] = None
+    cx: Optional[float] = None
+    cy: Optional[float] = None
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -192,16 +197,18 @@ def readColmapSceneInfo(path, images, eval, edge_mode, llffhold=8):
 def readCamerasFromTransforms(path, transformsfile, white_background, edge_mode, extension=".png"):
     cam_infos = []
 
-    with open(os.path.join(path, transformsfile)) as json_file:
+    with open(os.path.join(path, transformsfile), encoding="utf-8") as json_file:
         contents = json.load(json_file)
-        fovx = contents["camera_angle_x"]
+        shared_fovx = contents.get("camera_angle_x")
 
         frames = contents["frames"]
         for idx, frame in enumerate(frames):
-            cam_name = os.path.join(path, frame["file_path"] + extension)
+            relative_path = frame["file_path"]
+            relative_image_path = relative_path if Path(relative_path).suffix else relative_path + extension
+            image_path = os.path.join(path, relative_image_path)
 
             # NeRF 'transform_matrix' is a camera-to-world transform
-            c2w = np.array(frame["transform_matrix"])
+            c2w = np.array(frame["transform_matrix"], dtype=np.float64)
             # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
             c2w[:3, 1:3] *= -1
 
@@ -210,27 +217,49 @@ def readCamerasFromTransforms(path, transformsfile, white_background, edge_mode,
             R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
             T = w2c[:3, 3]
 
-            image_path = os.path.join(path, cam_name)
-            image_name = Path(cam_name).stem
-            image = Image.open(image_path)
+            image_name = Path(relative_image_path).stem
+            with Image.open(image_path) as source_image:
+                has_alpha = "A" in source_image.getbands() or "transparency" in source_image.info
+                alpha_image = None
+                if has_alpha:
+                    rgba = np.asarray(source_image.convert("RGBA"), dtype=np.float32) / 255.0
+                    alpha = rgba[:, :, 3:4]
+                    bg = np.array([1.0, 1.0, 1.0]) if white_background else np.array([0.0, 0.0, 0.0])
+                    composed = rgba[:, :, :3] * alpha + bg * (1.0 - alpha)
+                    image = Image.fromarray((composed * 255.0).round().astype(np.uint8), "RGB")
+                    alpha_rgb = np.repeat(alpha, 3, axis=2)
+                    alpha_image = Image.fromarray((alpha_rgb * 255.0).round().astype(np.uint8), "RGB")
+                else:
+                    image = source_image.convert("RGB")
 
-            im_data = np.array(image.convert("RGBA"))
+            declared_width = int(frame.get("w", image.size[0]))
+            declared_height = int(frame.get("h", image.size[1]))
+            if all(key in frame for key in ("fl_x", "fl_y", "cx", "cy")):
+                scale_x = float(image.size[0]) / float(declared_width)
+                scale_y = float(image.size[1]) / float(declared_height)
+                fx = float(frame["fl_x"]) * scale_x
+                fy = float(frame["fl_y"]) * scale_y
+                cx = float(frame["cx"]) * scale_x
+                cy = float(frame["cy"]) * scale_y
+                if not np.isfinite([fx, fy, cx, cy]).all() or fx <= 0 or fy <= 0:
+                    raise ValueError("Invalid per-frame intrinsics in {}".format(transformsfile))
+                FovX = focal2fov(fx, image.size[0])
+                FovY = focal2fov(fy, image.size[1])
+            else:
+                if shared_fovx is None:
+                    raise ValueError(
+                        "{} needs per-frame fl_x/fl_y/cx/cy or top-level camera_angle_x".format(
+                            transformsfile
+                        )
+                    )
+                FovX = float(shared_fovx)
+                FovY = focal2fov(fov2focal(FovX, image.size[0]), image.size[1])
+                fx = fy = cx = cy = None
 
-            bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
-
-            norm_data = im_data / 255.0
-            alpha_arr = norm_data[:, :, 3]
-            alpha_rgb = np.stack([alpha_arr, alpha_arr, alpha_arr], axis=-1)  # (H, W, 3)
-            alpha_image = Image.fromarray(np.array(alpha_rgb*255.0, dtype=np.byte), "RGB")
-
-            arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
-            image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
-
-            fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
-            FovY = fovy 
-            FovX = fovx
-
-            if frame["file_path"][3] == "e":
+            path_parts = Path(relative_path).parts
+            if path_parts and path_parts[0] in ("train", "test"):
+                folder = path_parts[0]
+            elif "test" in transformsfile.lower():
                 folder = "test"
             else:
                 folder = "train"
@@ -238,11 +267,13 @@ def readCamerasFromTransforms(path, transformsfile, white_background, edge_mode,
             sens_folder = os.path.join(path, f"{folder}/{edge_mode}")
             sens_name = image_name
             sens_path = os.path.join(sens_folder, os.path.basename(f"{sens_name}.png"))
-            sens = Image.open(sens_path)
+            with Image.open(sens_path) as sens_image:
+                sens = sens_image.copy()
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
                             image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1],
-                            sens=sens, sens_name=sens_name, sens_path=sens_path, alpha=alpha_image))
+                            sens=sens, sens_name=sens_name, sens_path=sens_path, alpha=alpha_image,
+                            fx=fx, fy=fy, cx=cx, cy=cy))
             
     return cam_infos
 

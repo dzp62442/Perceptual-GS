@@ -10,6 +10,7 @@
 #
 
 import logging
+import json
 import os
 import torch
 import torch.nn as nn
@@ -27,8 +28,9 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
-from time import time
+from time import perf_counter
 import torchvision
+from lpipsPyTorch.modules.lpips import LPIPS
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -36,7 +38,7 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, no_hd, no_md, edge_mode, no_sadr, no_ada_densification_strategy, all_dr, no_od, od_factor):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, no_hd, no_md, edge_mode, no_sadr, no_ada_densification_strategy, all_dr, no_od, od_factor, full_eval_metrics=False):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -59,10 +61,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
     bce_loss = nn.BCELoss()
 
-    total_time = 0
+    cumulative_training_time = 0.0
+    training_segment_start = None
+    full_eval_metric = None
+    if full_eval_metrics:
+        cpu_rng_state = torch.get_rng_state()
+        cuda_rng_state = torch.cuda.get_rng_state()
+        full_eval_metric = LPIPS(net_type="vgg").cuda().eval()
+        torch.set_rng_state(cpu_rng_state)
+        torch.cuda.set_rng_state(cuda_rng_state)
+        torch.cuda.synchronize()
+        training_segment_start = perf_counter()
 
     for iteration in range(first_iter, opt.iterations + 1):    
-        start = time()    
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -145,8 +156,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         torch.cuda.empty_cache()
         
         iter_end.record()
-        end = time()
-        total_time += (end-start)
         
         with torch.no_grad():
             # Progress bar
@@ -157,11 +166,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            # Log and save. Full OmniScene evaluation pauses the pure-training timer.
+            is_full_evaluation = full_eval_metrics and iteration in testing_iterations
+            if is_full_evaluation:
+                torch.cuda.synchronize()
+                cumulative_training_time += perf_counter() - training_segment_start
+            evaluation_result = training_report(
+                tb_writer, iteration, Ll1, loss, l1_loss,
+                iter_start.elapsed_time(iter_end), testing_iterations, scene, render,
+                (pipe, background), full_eval_metrics=full_eval_metrics,
+                full_eval_metric=full_eval_metric,
+            )
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+            if is_full_evaluation:
+                torch.cuda.synchronize()
+                training_segment_start = perf_counter()
 
             if iteration == 600:
                 scale = torch.max(gaussians.get_scaling, dim=1).values.reshape(-1, 1)
@@ -276,6 +297,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
+            if is_full_evaluation:
+                torch.cuda.synchronize()
+                cumulative_training_time += perf_counter() - training_segment_start
+                write_full_evaluation_record(
+                    scene.model_path,
+                    iteration,
+                    evaluation_result,
+                    cumulative_training_time,
+                )
+                if iteration < opt.iterations:
+                    torch.cuda.synchronize()
+                    training_segment_start = perf_counter()
+
     print("**********************************")
     print("Scene:", dataset.source_path)
     print("Gaussians:", gaussians._xyz.shape[0])
@@ -306,7 +340,75 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def _atomic_write_text(path, content):
+    temporary_path = path + ".tmp"
+    with open(temporary_path, "w", encoding="utf-8") as output_file:
+        output_file.write(content)
+    os.replace(temporary_path, path)
+
+def _atomic_write_json(path, payload):
+    temporary_path = path + ".tmp"
+    with open(temporary_path, "w", encoding="utf-8") as output_file:
+        json.dump(payload, output_file, indent=2, ensure_ascii=False)
+        output_file.write("\n")
+    os.replace(temporary_path, path)
+
+def _prepare_full_eval_directories(model_path, iteration):
+    iteration_path = os.path.join(model_path, "test", "ours_{}".format(iteration))
+    render_path = os.path.join(iteration_path, "renders")
+    gt_path = os.path.join(iteration_path, "gt")
+    for output_path in (render_path, gt_path):
+        os.makedirs(output_path, exist_ok=True)
+        for filename in os.listdir(output_path):
+            if filename.lower().endswith(".png"):
+                os.remove(os.path.join(output_path, filename))
+    return render_path, gt_path
+
+def write_full_evaluation_record(model_path, iteration, result, training_time_seconds):
+    if result is None:
+        raise RuntimeError("Full evaluation did not return metrics at iteration {}".format(iteration))
+    if not np.isfinite(training_time_seconds) or training_time_seconds < 0.0:
+        raise ValueError("Invalid cumulative training time: {}".format(training_time_seconds))
+
+    metrics_text = (
+        "PSNR : {:.7f}\n"
+        "SSIM : {:.7f}\n"
+        "LPIPS : {:.7f}\n"
+    ).format(result["psnr"], result["ssim"], result["lpips"])
+    _atomic_write_text(
+        os.path.join(model_path, "metrics_{}.txt".format(iteration)), metrics_text
+    )
+    _atomic_write_text(
+        os.path.join(model_path, "training_time_{}.txt".format(iteration)),
+        "TRAINING_TIME_SECONDS : {:.7f}\n".format(training_time_seconds),
+    )
+    evaluation_path = os.path.join(model_path, "evaluation")
+    os.makedirs(evaluation_path, exist_ok=True)
+    _atomic_write_json(
+        os.path.join(evaluation_path, "iteration_{}.json".format(iteration)),
+        {
+            "format_version": 1,
+            "iteration": int(iteration),
+            "split": "test",
+            "num_views": int(result["num_views"]),
+            "metrics": {
+                "l1": result["l1"],
+                "psnr": result["psnr"],
+                "ssim": result["ssim"],
+                "lpips": result["lpips"],
+            },
+            "training_time_seconds": float(training_time_seconds),
+            "per_view": result["per_view"],
+        },
+    )
+    print(
+        "\n[ITER {}] Full test: PSNR {:.4f} SSIM {:.4f} LPIPS {:.4f} TRAIN_TIME {:.3f}s".format(
+            iteration, result["psnr"], result["ssim"], result["lpips"],
+            training_time_seconds,
+        )
+    )
+
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, full_eval_metrics=False, full_eval_metric=None):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -314,14 +416,32 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
 
     # Report test and samples of training set
     if iteration in testing_iterations:
+        cpu_rng_state = torch.get_rng_state() if full_eval_metrics else None
+        cuda_rng_state = torch.cuda.get_rng_state() if full_eval_metrics else None
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+        if full_eval_metrics:
+            validation_configs = ({'name': 'test', 'cameras': scene.getTestCameras()},)
+        else:
+            validation_configs = (
+                {'name': 'test', 'cameras': scene.getTestCameras()},
+                {'name': 'train', 'cameras': [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]},
+            )
 
+        full_result = None
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
+                is_full_test = full_eval_metrics and config['name'] == 'test'
+                if is_full_test:
+                    if len(config['cameras']) != 18:
+                        raise ValueError("OmniScene full evaluation requires exactly 18 test cameras")
+                    if full_eval_metric is None:
+                        raise ValueError("LPIPS metric is required for full evaluation")
+                    render_path, gt_path = _prepare_full_eval_directories(scene.model_path, iteration)
                 l1_test = 0.0
                 psnr_test = 0.0
+                ssim_test = 0.0
+                lpips_test = 0.0
+                per_view = {}
                 for idx, viewpoint in enumerate(config['cameras']):
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
@@ -329,41 +449,82 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
+                    view_l1 = l1_loss(image, gt_image).mean().double()
+                    if is_full_test:
+                        view_psnr = psnr(image[None], gt_image[None]).mean().double()
+                    else:
+                        # Preserve the repository's original per-channel report outside
+                        # the explicit OmniScene full-evaluation path.
+                        view_psnr = psnr(image, gt_image).mean().double()
+                    l1_test += view_l1
+                    psnr_test += view_psnr
+                    if is_full_test:
+                        view_ssim = ssim(image[None], gt_image[None]).mean().double()
+                        ssim_test += view_ssim
+                        view_lpips = full_eval_metric(image[None], gt_image[None]).mean().double()
+                        lpips_test += view_lpips
+                        filename = viewpoint.image_name + ".png"
+                        torchvision.utils.save_image(image, os.path.join(render_path, filename))
+                        torchvision.utils.save_image(gt_image, os.path.join(gt_path, filename))
+                        per_view[viewpoint.image_name] = {
+                            "l1": view_l1.item(),
+                            "psnr": view_psnr.item(),
+                            "ssim": view_ssim.item(),
+                            "lpips": view_lpips.item(),
+                        }
                 psnr_test /= len(config['cameras'])
+                ssim_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
+                if is_full_test:
+                    lpips_test /= len(config['cameras'])
+                    full_result = {
+                        "num_views": len(config['cameras']),
+                        "l1": l1_test.item(),
+                        "psnr": psnr_test.item(),
+                        "ssim": ssim_test.item(),
+                        "lpips": lpips_test.item(),
+                        "per_view": per_view,
+                    }
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+                    if is_full_test:
+                        tb_writer.add_scalar(config['name'] + '/loss_viewpoint - ssim', ssim_test, iteration)
+                        tb_writer.add_scalar(config['name'] + '/loss_viewpoint - lpips', lpips_test, iteration)
 
         # sensitivity test
-        torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+        if not full_eval_metrics:
+            torch.cuda.empty_cache()
+            validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()},
+                                  {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
         
-        bce_loss = nn.BCELoss()
+            bce_loss = nn.BCELoss()
 
-        for config in validation_configs:
-            if config['cameras'] and len(config['cameras']) > 0:
-                bce_test = 0.0
-                psnr_test = 0.0
-                for idx, viewpoint in enumerate(config['cameras']):
-                    sens = torch.clamp(render(viewpoint, scene.gaussians, renderArgs[0], renderArgs[1], override_color=(scene.gaussians.get_sensitivity).repeat(1, 3))["render"][0], 0.0, 1.0)
-                    sens = sens[None, :]
-                    gt_sens = torch.clamp(viewpoint.sens.to("cuda"), 0.0, 1.0)
+            for config in validation_configs:
+                if config['cameras'] and len(config['cameras']) > 0:
+                    bce_test = 0.0
+                    psnr_test = 0.0
+                    for idx, viewpoint in enumerate(config['cameras']):
+                        sens = torch.clamp(render(viewpoint, scene.gaussians, renderArgs[0], renderArgs[1], override_color=(scene.gaussians.get_sensitivity).repeat(1, 3))["render"][0], 0.0, 1.0)
+                        sens = sens[None, :]
+                        gt_sens = torch.clamp(viewpoint.sens.to("cuda"), 0.0, 1.0)
 
-                    bce_test += bce_loss(sens, gt_sens).mean().double()
-                    psnr_test += psnr(sens, gt_sens).mean().double()
-                psnr_test /= len(config['cameras'])
-                bce_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: BCE {} PSNR {}".format(iteration, config['name'], bce_test, psnr_test))
+                        bce_test += bce_loss(sens, gt_sens).mean().double()
+                        psnr_test += psnr(sens, gt_sens).mean().double()
+                    psnr_test /= len(config['cameras'])
+                    bce_test /= len(config['cameras'])
+                    print("\n[ITER {}] Evaluating {}: BCE {} PSNR {}".format(iteration, config['name'], bce_test, psnr_test))
 
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+        if full_eval_metrics:
+            torch.set_rng_state(cpu_rng_state)
+            torch.cuda.set_rng_state(cuda_rng_state)
         torch.cuda.empty_cache()
+        return full_result
+    return None
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -387,6 +548,8 @@ if __name__ == "__main__":
     parser.add_argument("--edge_mode", type=str, default = "sensitivity_maps")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--full_eval_metrics", action="store_true",
+                        help="Save all test renders, metrics, and cumulative pure-training time")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -398,7 +561,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.no_hd, args.no_md, args.edge_mode, args.no_sadr, args.no_ada_densification_strategy, args.all_dr, args.no_od, args.od_factor)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.no_hd, args.no_md, args.edge_mode, args.no_sadr, args.no_ada_densification_strategy, args.all_dr, args.no_od, args.od_factor, full_eval_metrics=args.full_eval_metrics)
 
     # All done
     print("\nTraining complete.")
