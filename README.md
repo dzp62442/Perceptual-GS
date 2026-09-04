@@ -67,9 +67,10 @@ This repository provides the official PyTorch implementation for the paper "Perc
 ## Environment setup
 To start, we prefer creating the environment using conda:
 ```sh
-conda create -n perceptual_gs python=3.7
+conda create -n perceptual_gs python=3.8
 conda activate perceptual_gs
-pip install torch==1.12.1+cu116 torchvision==0.13.1+cu116 -f https://download.pytorch.org/whl/torch_stable.html
+# 原项目使用 torch 1.12.1+cu116
+pip install torch==2.0.0 torchvision==0.15.1 torchaudio==2.0.1 --index-url https://download.pytorch.org/whl/cu118
 pip install -r requirements.txt
 ```
 
