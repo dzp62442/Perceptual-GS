@@ -1,0 +1,71 @@
+# Operating system and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python caches and packaging artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+pip-wheel-metadata/
+
+# Native, CUDA, and CMake build artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.pyd
+*.dylib
+*.dll
+*.d
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+.ninja_deps
+.ninja_log
+
+# Test, lint, and coverage caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local environments
+.venv/
+venv/
+env/
+.conda/
+
+# Experiment data and outputs
+data/
+datasets/
+output/
+outputs/
+eval/
+results/
+runs/
+wandb/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+events.out.tfevents.*
+
+# Notebook checkpoints and logs
+.ipynb_checkpoints/
+*.log
