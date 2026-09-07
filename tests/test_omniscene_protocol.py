@@ -4,6 +4,8 @@ import pickle
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 import torch
@@ -265,7 +267,15 @@ class PreprocessAndCameraTest(unittest.TestCase):
 class RunnerProtocolTest(unittest.TestCase):
     EVAL_ITERATIONS = (1, 2, 3)
 
-    def _make_outputs(self, model_path, prepared_scene, training_times=(1.0, 2.0, 3.0)):
+    def _make_outputs(
+        self,
+        model_path,
+        prepared_scene,
+        training_times=(1.0, 2.0, 3.0),
+        psnr_base=20.0,
+        fixed_ssim=None,
+        fixed_lpips=None,
+    ):
         model_path.mkdir(parents=True, exist_ok=True)
         for name in ("cfg_args", "input.ply", "cameras.json"):
             (model_path / name).write_bytes(b"x")
@@ -275,9 +285,20 @@ class RunnerProtocolTest(unittest.TestCase):
         (final_dir / "sensitivity.ply").write_bytes(b"torch")
         names = run_omniscene.expected_test_image_names(prepared_scene)
         for iteration, training_time in zip(self.EVAL_ITERATIONS, training_times):
+            values = {
+                "psnr": psnr_base + iteration,
+                "ssim": (
+                    fixed_ssim if fixed_ssim is not None
+                    else 0.7 + iteration / 100.0
+                ),
+                "lpips": (
+                    fixed_lpips if fixed_lpips is not None
+                    else 0.2 - iteration / 100.0
+                ),
+            }
             (model_path / "metrics_{}.txt".format(iteration)).write_text(
                 "PSNR : {:.7f}\nSSIM : {:.7f}\nLPIPS : {:.7f}\n".format(
-                    20.0 + iteration, 0.7 + iteration / 100.0, 0.2 - iteration / 100.0
+                    values["psnr"], values["ssim"], values["lpips"]
                 ),
                 encoding="utf-8",
             )
@@ -290,6 +311,33 @@ class RunnerProtocolTest(unittest.TestCase):
                 output_dir.mkdir(parents=True, exist_ok=True)
                 for name in names:
                     Image.new("RGB", (10, 8), color=(iteration, 0, 0)).save(output_dir / name)
+            _write_json(
+                model_path / "evaluation" / "iteration_{}.json".format(iteration),
+                {
+                    "format_version": 1,
+                    "iteration": iteration,
+                    "num_views": len(names),
+                    "metrics": dict(values),
+                    "training_time_seconds": training_time,
+                    "per_view": {
+                        Path(name).stem: {"l1": 0.1, **values}
+                        for name in names
+                    },
+                },
+            )
+
+    def _set_novel_metrics(self, model_path, iteration, novel_metrics):
+        evaluation_path = model_path / "evaluation" / "iteration_{}.json".format(iteration)
+        payload = json.loads(evaluation_path.read_text(encoding="utf-8"))
+        names = list(payload["per_view"])
+        for metric, novel_value in novel_metrics.items():
+            all_value = payload["metrics"][metric]
+            context_value = 3.0 * all_value - 2.0 * novel_value
+            for name in names[:run_omniscene.NOVEL_VIEW_COUNT]:
+                payload["per_view"][name][metric] = novel_value
+            for name in names[run_omniscene.NOVEL_VIEW_COUNT:]:
+                payload["per_view"][name][metric] = context_value
+        _write_json(evaluation_path, payload)
 
     def test_command_is_one_run_without_checkpoints(self):
         command = run_omniscene.build_train_command(
@@ -302,6 +350,64 @@ class RunnerProtocolTest(unittest.TestCase):
         self.assertEqual(command[command.index("-r") + 1], "1")
         self.assertNotIn("--checkpoint_iterations", command)
         self.assertNotIn("--start_checkpoint", command)
+
+    def test_metrics_only_backfills_novel_views_without_touching_training_time(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            sample = _synthetic_sample()
+            scene_name = "001_{}".format(sample["bin_token"])
+            prepared_scene = preprocess_scene(
+                sample, root / "prepared", scene_name, 1, "val", root, 0.3
+            )
+            model_path = root / "results" / scene_name
+            self._make_outputs(model_path, prepared_scene)
+            self._set_novel_metrics(
+                model_path, 1, {"psnr": 15.0, "ssim": 0.6, "lpips": 0.25}
+            )
+            run_omniscene._write_scene_completion(
+                model_path, "val", scene_name, sample["bin_token"],
+                (8, 10), 3, self.EVAL_ITERATIONS,
+            )
+
+            time_paths = [
+                model_path / "training_time_{}.txt".format(iteration)
+                for iteration in self.EVAL_ITERATIONS
+            ]
+            time_state = {
+                path: (path.read_bytes(), path.stat().st_mtime_ns)
+                for path in time_paths
+            }
+            marker_path = model_path / "scene_complete.json"
+            marker_state = (marker_path.read_bytes(), marker_path.stat().st_mtime_ns)
+            dataset = SimpleNamespace(
+                bin_tokens=[sample["bin_token"]],
+                resolution=(8, 10),
+                mode="val",
+                data_root=root,
+                scene_name=lambda index: scene_name,
+            )
+            with mock.patch.object(run_omniscene, "_run_command") as run_command:
+                run_omniscene.collect_completed_scene_metrics(
+                    dataset, 0, root / "prepared", root / "results",
+                    0.3, 3, self.EVAL_ITERATIONS,
+                )
+                run_command.assert_not_called()
+
+            summary = json.loads(
+                (model_path / "view_metrics_summary.json").read_text(encoding="utf-8")
+            )
+            metrics = summary["iterations"]["1"]
+            self.assertEqual(metrics["all_18"]["num_views"], 18)
+            self.assertEqual(metrics["novel_12"]["num_views"], 12)
+            self.assertAlmostEqual(metrics["all_18"]["psnr"], 21.0)
+            self.assertAlmostEqual(metrics["novel_12"]["psnr"], 15.0)
+            for path in time_paths:
+                self.assertEqual(
+                    (path.read_bytes(), path.stat().st_mtime_ns), time_state[path]
+                )
+            self.assertEqual(
+                (marker_path.read_bytes(), marker_path.stat().st_mtime_ns), marker_state
+            )
 
     def test_completion_is_artifact_strict_but_git_loose(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -384,15 +490,18 @@ class RunnerProtocolTest(unittest.TestCase):
                     sample, root / "prepared", scene_name, index + 1, "val", root, 0.3
                 )
                 model_path = root / "results" / scene_name
-                self._make_outputs(model_path, prepared_scene)
                 if index == 1:
+                    self._make_outputs(
+                        model_path, prepared_scene, psnr_base=40.0,
+                        fixed_ssim=0.9, fixed_lpips=0.1,
+                    )
                     for iteration in self.EVAL_ITERATIONS:
-                        (model_path / "metrics_{}.txt".format(iteration)).write_text(
-                            "PSNR : {:.7f}\nSSIM : {:.7f}\nLPIPS : {:.7f}\n".format(
-                                40.0 + iteration, 0.9, 0.1
-                            ),
-                            encoding="utf-8",
+                        self._set_novel_metrics(
+                            model_path, iteration,
+                            {"psnr": 30.0 + iteration, "ssim": 0.85, "lpips": 0.12},
                         )
+                else:
+                    self._make_outputs(model_path, prepared_scene)
                 run_omniscene._write_scene_completion(
                     model_path, "val", scene_name, token, (8, 10), 3,
                     self.EVAL_ITERATIONS,
@@ -413,7 +522,14 @@ class RunnerProtocolTest(unittest.TestCase):
             }
             summary = run_omniscene.aggregate_results(root / "results", records, protocol)
             self.assertAlmostEqual(summary["averages"]["1"]["psnr"], 31.0)
+            self.assertAlmostEqual(
+                summary["averages"]["1"]["all_18"]["psnr"], 31.0
+            )
+            self.assertAlmostEqual(
+                summary["averages"]["1"]["novel_12"]["psnr"], 26.0
+            )
             self.assertEqual(summary["averages"]["3"]["num_samples"], 2)
+            self.assertIn("novel_12", summary["samples"][0]["metrics"]["1"])
             self.assertTrue((root / "results" / "val_metrics_summary.json").is_file())
 
 

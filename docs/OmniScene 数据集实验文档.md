@@ -376,6 +376,14 @@ Perceptual-GS 默认 `densify_until_iter=15000`，高于本实验的 10000 上�
 conda run -n perceptual_gs python scripts/run_omniscene.py
 ```
 
+若实验已完成、只需补充或重新生成统计，使用纯 CPU 模式：
+
+```bash
+conda run -n perceptual_gs python scripts/run_omniscene.py --metrics-only
+```
+
+`--metrics-only` 只校验完整场景并读取已有的逐视角 JSON，不执行预处理、训练或渲染，也不初始化 CUDA；遇到不完整场景会直接报错，不会转入重训。
+
 默认参数：
 
 - mode：`center150`；
@@ -440,6 +448,7 @@ output/omniscene_results/center150_112x200/
 │   ├── training_time_1000.txt
 │   ├── training_time_5000.txt
 │   ├── training_time_10000.txt
+│   ├── view_metrics_summary.json       # 18 路全视角与前 12 路新视角
 │   ├── test/
 │   │   ├── ours_1000/{renders,gt}/   # 各 18 张
 │   │   ├── ours_5000/{renders,gt}/   # 各 18 张
@@ -493,9 +502,12 @@ output/omniscene_results/center150_112x200/
 
 - 协议版本、数据根目录、分辨率、阈值、总迭代数、评估点、样本数和生成时间；
 - 150 个场景的 scene name、bin token、各里程碑指标和训练耗时；
-- 1k、5k、10k 各自的 150 场景等权平均 PSNR、SSIM、LPIPS 和累计训练耗时。
+- 每个场景在 1k、5k、10k 的 `all_18`（12 路新视角 + 6 路输入视角）和 `novel_12`（`transforms_test.json`/GT 的前 12 路）PSNR、SSIM、LPIPS；
+- 1k、5k、10k 各自的 150 场景等权 `all_18`、`novel_12` 平均指标和累计训练耗时。
 
-平均顺序为：先对每个 bin 的 18 个视角求均值，再对 150 个 bin 求均值，不能把全部图像打散后按图像数量加权。
+平均顺序为：先分别对每个 bin 的 18 路全视角、前 12 路新视角求均值，再对 150 个 bin 等权求均值，不能把全部图像打散后按图像数量加权。汇总 JSON 保留原有扁平 `psnr/ssim/lpips` 字段作为 `all_18` 的兼容别名，同时新增显式的 `all_18` 和 `novel_12` 字段。
+
+新视角统计直接读取训练阶段已经保存的 `evaluation/iteration_<N>.json` 逐视角值，并按 `transforms_test.json` 顺序选取前 12 路，不重新渲染、不重新计算 LPIPS。补统计只新增或更新派生的 `view_metrics_summary.json` 与总汇总文件；已有 `metrics_<N>.txt`、`training_time_<N>.txt` 和 `scene_complete.json` 不改写，其中训练时间继续采用原实验记录值。
 
 ## 10. 计划验证与验收标准
 

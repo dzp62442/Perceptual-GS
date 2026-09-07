@@ -40,7 +40,13 @@ DEFAULT_CONFIDENCE_THRESHOLD = 0.3
 PROTOCOL_VERSION = 1
 SCENE_COMPLETE_VERSION = 1
 METRIC_NAMES = ("PSNR", "SSIM", "LPIPS")
+METRIC_KEYS = tuple(name.lower() for name in METRIC_NAMES)
 TRAINING_TIME_KEY = "training_time_seconds"
+NOVEL_VIEW_COUNT = TARGET_VIEW_COUNT - TRAIN_VIEW_COUNT
+ALL_VIEW_GROUP = "all_18"
+NOVEL_VIEW_GROUP = "novel_12"
+VIEW_GROUPS = (ALL_VIEW_GROUP, NOVEL_VIEW_GROUP)
+VIEW_METRICS_SUMMARY_VERSION = 1
 RESERVED_EXTRA_ARGS = {
     "-s", "--source_path", "-m", "--model_path", "-r", "--resolution",
     "--eval", "--iterations", "--test_iterations", "--save_iterations",
@@ -104,6 +110,137 @@ def parse_training_time(path: Path) -> float:
     if not math.isfinite(training_time) or training_time < 0.0:
         raise ValueError("Invalid training time in {}".format(path))
     return training_time
+
+
+def _finite_metric(value, name: str, path: Path) -> float:
+    try:
+        value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid {} in {}".format(name, path)) from exc
+    if not math.isfinite(value):
+        raise ValueError("Non-finite {} in {}".format(name, path))
+    return value
+
+
+def _mean_view_metrics(per_view: Dict[str, Dict[str, float]], view_names: Sequence[str]) -> Dict[str, float]:
+    if not view_names:
+        raise ValueError("Cannot average an empty view group")
+    return {
+        metric: math.fsum(per_view[name][metric] for name in view_names) / len(view_names)
+        for metric in METRIC_KEYS
+    }
+
+
+def read_iteration_view_metrics(
+    model_path: Path,
+    prepared_scene: Path,
+    iteration: int,
+) -> Dict:
+    """Read existing per-view metrics and derive all-18/novel-12 means on CPU."""
+    evaluation_path = model_path / "evaluation" / "iteration_{}.json".format(iteration)
+    try:
+        payload = json.loads(evaluation_path.read_text(encoding="utf-8"))
+        if int(payload["iteration"]) != int(iteration):
+            raise ValueError("Iteration mismatch in {}".format(evaluation_path))
+        if int(payload["num_views"]) != TARGET_VIEW_COUNT:
+            raise ValueError("Expected 18 views in {}".format(evaluation_path))
+        raw_per_view = payload["per_view"]
+        if not isinstance(raw_per_view, dict):
+            raise ValueError("Invalid per_view mapping in {}".format(evaluation_path))
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("Invalid per-view evaluation file: {}".format(evaluation_path)) from exc
+
+    ordered_names = [Path(name).stem for name in expected_test_image_names(prepared_scene)]
+    if set(raw_per_view) != set(ordered_names) or len(raw_per_view) != TARGET_VIEW_COUNT:
+        raise ValueError("Per-view keys do not match transforms_test.json in {}".format(evaluation_path))
+
+    per_view = {}
+    for view_name in ordered_names:
+        try:
+            record = raw_per_view[view_name]
+            per_view[view_name] = {
+                metric: _finite_metric(record[metric], metric, evaluation_path)
+                for metric in METRIC_KEYS
+            }
+        except (KeyError, TypeError) as exc:
+            raise ValueError("Incomplete per-view metrics in {}".format(evaluation_path)) from exc
+
+    all_18_from_views = _mean_view_metrics(per_view, ordered_names)
+    all_18_file = {
+        name.lower(): value
+        for name, value in parse_metrics(
+            model_path / "metrics_{}.txt".format(iteration)
+        ).items()
+    }
+    for metric in METRIC_KEYS:
+        if not math.isclose(
+            all_18_from_views[metric], all_18_file[metric], rel_tol=0.0, abs_tol=5e-7
+        ):
+            raise ValueError(
+                "{} all-view mean disagrees with metrics_{}.txt in {}".format(
+                    metric, iteration, model_path
+                )
+            )
+
+    novel_names = ordered_names[:NOVEL_VIEW_COUNT]
+    return {
+        ALL_VIEW_GROUP: {
+            "num_views": TARGET_VIEW_COUNT,
+            **all_18_file,
+        },
+        NOVEL_VIEW_GROUP: {
+            "num_views": NOVEL_VIEW_COUNT,
+            **_mean_view_metrics(per_view, novel_names),
+        },
+        TRAINING_TIME_KEY: parse_training_time(
+            model_path / "training_time_{}.txt".format(iteration)
+        ),
+    }
+
+
+def build_scene_view_metrics_summary(
+    model_path: Path,
+    prepared_scene: Path,
+    scene_name: str,
+    bin_token: str,
+    eval_iterations: Sequence[int],
+) -> Dict:
+    return {
+        "format_version": VIEW_METRICS_SUMMARY_VERSION,
+        "scene_name": scene_name,
+        "bin_token": bin_token,
+        "view_groups": {
+            ALL_VIEW_GROUP: {
+                "num_views": TARGET_VIEW_COUNT,
+                "description": "all target views (12 novel + 6 context)",
+            },
+            NOVEL_VIEW_GROUP: {
+                "num_views": NOVEL_VIEW_COUNT,
+                "description": "first 12 target views (novel views only)",
+            },
+        },
+        "iterations": {
+            str(iteration): read_iteration_view_metrics(
+                model_path, prepared_scene, iteration
+            )
+            for iteration in eval_iterations
+        },
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def write_scene_view_metrics_summary(
+    model_path: Path,
+    prepared_scene: Path,
+    scene_name: str,
+    bin_token: str,
+    eval_iterations: Sequence[int],
+) -> Dict:
+    summary = build_scene_view_metrics_summary(
+        model_path, prepared_scene, scene_name, bin_token, eval_iterations
+    )
+    _atomic_write_json(model_path / "view_metrics_summary.json", summary)
+    return summary
 
 
 def _artifact_exists(path: Path) -> bool:
@@ -370,6 +507,9 @@ def run_scene(
         iterations, eval_iterations,
     ):
         print("[SKIP] Completed scene: {}".format(scene_name), flush=True)
+        write_scene_view_metrics_summary(
+            model_path, prepared_scene, scene_name, bin_token, eval_iterations
+        )
         return record
 
     scene_data = dataset[dataset_index]
@@ -414,8 +554,43 @@ def run_scene(
         iterations, eval_iterations,
     ):
         raise RuntimeError("Scene completion marker failed validation: {}".format(scene_name))
+    write_scene_view_metrics_summary(
+        model_path, prepared_scene, scene_name, bin_token, eval_iterations
+    )
     print("[DONE] {}".format(scene_name), flush=True)
     return record
+
+
+def collect_completed_scene_metrics(
+    dataset: OmniSceneDataset,
+    dataset_index: int,
+    prepared_root: Path,
+    experiment_root: Path,
+    confidence_threshold: float,
+    iterations: int,
+    eval_iterations: Sequence[int],
+) -> Tuple[str, str, Path, Path]:
+    """Backfill derived metrics without preprocessing, training, or rendering."""
+    scene_index = dataset_index + 1
+    scene_name = dataset.scene_name(dataset_index)
+    bin_token = dataset.bin_tokens[dataset_index]
+    prepared_scene = prepared_root / scene_name
+    model_path = experiment_root / scene_name
+    if not scene_complete(
+        model_path, prepared_scene, scene_name, bin_token, dataset.resolution,
+        confidence_threshold, dataset.mode, scene_index, dataset.data_root,
+        iterations, eval_iterations,
+    ):
+        raise RuntimeError(
+            "Metrics-only mode found an incomplete scene and will not start training: {}".format(
+                scene_name
+            )
+        )
+    print("[SKIP] Completed scene: {}".format(scene_name), flush=True)
+    write_scene_view_metrics_summary(
+        model_path, prepared_scene, scene_name, bin_token, eval_iterations
+    )
+    return scene_name, bin_token, prepared_scene, model_path
 
 
 def aggregate_results(
@@ -429,9 +604,13 @@ def aggregate_results(
 
     eval_iterations = tuple(protocol["eval_iterations"])
     accumulators = {
-        iteration: {name: [] for name in METRIC_NAMES + (TRAINING_TIME_KEY,)}
+        iteration: {
+            group: {metric: [] for metric in METRIC_KEYS}
+            for group in VIEW_GROUPS
+        }
         for iteration in eval_iterations
     }
+    training_times = {iteration: [] for iteration in eval_iterations}
     samples = []
     for scene_index, (scene_name, bin_token, prepared_scene, model_path) in enumerate(
         scene_records, 1
@@ -443,38 +622,58 @@ def aggregate_results(
             protocol["iterations"], eval_iterations,
         ):
             raise RuntimeError("Cannot aggregate incomplete scene: {}".format(scene_name))
+        scene_summary = write_scene_view_metrics_summary(
+            model_path, prepared_scene, scene_name, bin_token, eval_iterations
+        )
         sample_metrics = {}
         for iteration in eval_iterations:
-            values = parse_metrics(model_path / "metrics_{}.txt".format(iteration))
-            training_time = parse_training_time(
-                model_path / "training_time_{}.txt".format(iteration)
-            )
+            scoped_metrics = scene_summary["iterations"][str(iteration)]
+            all_18 = scoped_metrics[ALL_VIEW_GROUP]
+            novel_12 = scoped_metrics[NOVEL_VIEW_GROUP]
+            training_time = scoped_metrics[TRAINING_TIME_KEY]
             sample_metrics[str(iteration)] = {
-                "psnr": values["PSNR"],
-                "ssim": values["SSIM"],
-                "lpips": values["LPIPS"],
+                # Preserve the original flat fields as all-18 compatibility aliases.
+                **{metric: all_18[metric] for metric in METRIC_KEYS},
                 TRAINING_TIME_KEY: training_time,
+                ALL_VIEW_GROUP: dict(all_18),
+                NOVEL_VIEW_GROUP: dict(novel_12),
             }
-            for name in METRIC_NAMES:
-                accumulators[iteration][name].append(values[name])
-            accumulators[iteration][TRAINING_TIME_KEY].append(training_time)
+            for group in VIEW_GROUPS:
+                for metric in METRIC_KEYS:
+                    accumulators[iteration][group][metric].append(
+                        scoped_metrics[group][metric]
+                    )
+            training_times[iteration].append(training_time)
         samples.append(
             {"scene_name": scene_name, "bin_token": bin_token, "metrics": sample_metrics}
         )
 
     averages = {}
     for iteration in eval_iterations:
+        group_averages = {
+            group: {
+                "num_samples": expected_count,
+                "num_views_per_sample": (
+                    TARGET_VIEW_COUNT if group == ALL_VIEW_GROUP else NOVEL_VIEW_COUNT
+                ),
+                **{
+                    metric: sum(accumulators[iteration][group][metric]) / expected_count
+                    for metric in METRIC_KEYS
+                },
+            }
+            for group in VIEW_GROUPS
+        }
+        all_18 = group_averages[ALL_VIEW_GROUP]
         averages[str(iteration)] = {
             "num_samples": expected_count,
-            "psnr": sum(accumulators[iteration]["PSNR"]) / expected_count,
-            "ssim": sum(accumulators[iteration]["SSIM"]) / expected_count,
-            "lpips": sum(accumulators[iteration]["LPIPS"]) / expected_count,
-            TRAINING_TIME_KEY: (
-                sum(accumulators[iteration][TRAINING_TIME_KEY]) / expected_count
-            ),
+            # Preserve the original flat fields as all-18 compatibility aliases.
+            **{metric: all_18[metric] for metric in METRIC_KEYS},
+            TRAINING_TIME_KEY: sum(training_times[iteration]) / expected_count,
+            **group_averages,
         }
 
     summary = {
+        "metrics_summary_version": 2,
         "protocol_version": PROTOCOL_VERSION,
         "split": protocol["split"],
         "sample_count": expected_count,
@@ -484,6 +683,16 @@ def aggregate_results(
         "iterations": protocol["iterations"],
         "eval_iterations": protocol["eval_iterations"],
         "extra_train_args": protocol["extra_train_args"],
+        "view_groups": {
+            ALL_VIEW_GROUP: {
+                "num_views_per_sample": TARGET_VIEW_COUNT,
+                "description": "all target views (12 novel + 6 context)",
+            },
+            NOVEL_VIEW_GROUP: {
+                "num_views_per_sample": NOVEL_VIEW_COUNT,
+                "description": "first 12 target views (novel views only)",
+            },
+        },
         "averages": averages,
         "samples": samples,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -494,14 +703,21 @@ def aggregate_results(
     lines = ["{} samples: {}".format(prefix, expected_count)]
     for iteration in eval_iterations:
         result = averages[str(iteration)]
-        lines.extend(
-            (
-                "Iteration {}".format(iteration),
-                "PSNR : {:.7f}".format(result["psnr"]),
-                "SSIM : {:.7f}".format(result["ssim"]),
-                "LPIPS : {:.7f}".format(result["lpips"]),
-                "TRAINING_TIME_SECONDS : {:.7f}".format(result[TRAINING_TIME_KEY]),
+        lines.append("Iteration {}".format(iteration))
+        for group in VIEW_GROUPS:
+            group_result = result[group]
+            lines.extend(
+                (
+                    "{} ({} views/sample)".format(
+                        group.upper(), group_result["num_views_per_sample"]
+                    ),
+                    "PSNR : {:.7f}".format(group_result["psnr"]),
+                    "SSIM : {:.7f}".format(group_result["ssim"]),
+                    "LPIPS : {:.7f}".format(group_result["lpips"]),
+                )
             )
+        lines.append(
+            "TRAINING_TIME_SECONDS : {:.7f}".format(result[TRAINING_TIME_KEY])
         )
     _atomic_write_text(
         experiment_root / "{}_metrics_summary.txt".format(prefix), "\n".join(lines) + "\n"
@@ -589,6 +805,13 @@ def main() -> None:
     )
     parser.add_argument("--gpu", default="0")
     parser.add_argument(
+        "--metrics-only", action="store_true",
+        help=(
+            "Only backfill all-18/novel-12 statistics from completed artifacts; "
+            "never preprocess, train, render, or use CUDA"
+        ),
+    )
+    parser.add_argument(
         "--scene-indices", nargs="+", type=int,
         help="Optional one-based scene indices; useful for smoke tests and partial scheduling",
     )
@@ -653,11 +876,17 @@ def main() -> None:
         selected_indices = [value - 1 for value in args.scene_indices]
 
     for dataset_index in selected_indices:
-        run_scene(
-            dataset, dataset_index, prepared_root, experiment_root,
-            args.conf_threshold, args.gpu, args.iterations, eval_iterations,
-            args.extra_train_args,
-        )
+        if args.metrics_only:
+            collect_completed_scene_metrics(
+                dataset, dataset_index, prepared_root, experiment_root,
+                args.conf_threshold, args.iterations, eval_iterations,
+            )
+        else:
+            run_scene(
+                dataset, dataset_index, prepared_root, experiment_root,
+                args.conf_threshold, args.gpu, args.iterations, eval_iterations,
+                args.extra_train_args,
+            )
 
     all_records = _all_scene_records(dataset, prepared_root, experiment_root)
     all_complete = all(
