@@ -99,13 +99,15 @@ Perceptual-GS/
 ├── comp_svfgs/
 │   ├── __init__.py
 │   ├── dataset_omniscene.py       # split、bin、图像、K、c2w、绝对深度/置信度加载
-│   └── omniscene_preprocess.py    # 场景物化、敏感度图、点云、缓存校验
+│   ├── omniscene_preprocess.py    # 场景物化、敏感度图、点云、缓存校验
+│   └── pruning_experiment.py      # 可选剪枝探索的目录隔离、协议与诊断校验
 ├── docs/
 │   └── OmniScene 数据集实验文档.md
 ├── scripts/
 │   └── run_omniscene.py           # 单入口调度、完成态检查与汇总
 ├── tests/
-│   └── test_omniscene_protocol.py # 数据协议、坐标和断点语义测试
+│   ├── test_omniscene_protocol.py # 数据协议、坐标和断点语义测试
+│   └── test_pruning_experiment.py # 探索隔离、缓存复用、样本恢复和剪枝测试
 └── output/                        # 运行时自动创建，已由 .gitignore 忽略
 ```
 
@@ -113,7 +115,8 @@ Perceptual-GS/
 
 - `scene/dataset_readers.py`：读取逐帧 K、稳健识别 train/test 路径、正确处理 RGB 图像的 alpha，并加载 prepared PLY；
 - `scene/cameras.py`、`utils/camera_utils.py`、必要时 `utils/graphics_utils.py`：把逐帧 `fx/fy/cx/cy` 贯通到投影矩阵；
-- `train.py`：增加仅由 OmniScene runner 开启的完整里程碑评估和累计训练计时；
+- `train.py`：增加仅由 OmniScene runner 开启的完整里程碑评估和累计训练计时，以及显式启用的剪枝探索诊断；
+- `scene/gaussian_model.py`：为最终世界尺度剪枝增加默认开启的独立开关，供探索入口关闭；
 - `metrics.py` 或一个可复用指标 helper：复用项目现有 PSNR/SSIM/LPIPS 定义，避免重新定义指标；
 - `.gitignore`：现有 `output/` 规则已经覆盖运行结果，原则上不再扩大忽略范围。
 
@@ -430,6 +433,30 @@ conda run -n perceptual_gs python scripts/run_omniscene.py \
 ```
 
 预处理、加载、训练、渲染、评估都由同一个顶层 runner 顺序调度，用户不需要先执行单独的 prepare 命令。
+
+### 8.3 二审世界尺度剪枝探索
+
+已有 `output/omniscene_results/center150_112x200/` 直接作为对照，不增加另一轮对照实验。不传参数的 `python scripts/run_omniscene.py` 保持原训练配置、结果目录和样本级恢复行为。
+
+在 `perceptual_gs` 环境中，待前一项目训练结束、GPU 空闲后执行：
+
+```bash
+python scripts/run_omniscene.py --experiment no-world-prune
+
+# 可选：先运行原编号中的几个样本
+python scripts/run_omniscene.py --experiment no-world-prune --scene-indices 1 75 150
+
+# 只读校验缓存和预览命令，不训练、不创建或刷新结果
+python scripts/run_omniscene.py --experiment no-world-prune --scene-indices 1 --dry-run
+```
+
+- 新结果默认写入 `output/omniscene_revision2/no-world-prune/center150_112x200/`，复用 `output/omniscene_prepared/center150_112x200/`。探索模式先检查全部选中样本的缓存；缓存缺失或不兼容直接报错，不加载原始样本、不重新生成或改写共享缓存。
+- `--result-root` 可指定其他独立根目录；解析真实路径和符号链接后，不能覆盖原结果、prepared 缓存或原始数据。全局 protocol、逐样本 `pruning_experiment.json` 和完成标记记录探索模式，阻止两种实验混用。
+- 唯一训练干预是去掉最终剪枝 mask 中的 `max(scale) > 0.1 * cameras_extent` 条件。opacity/screen-size 剪枝、感知敏感度引导的 clone/split、opacity redistribution/reset、alpha 剪枝、相机设置和学习率保持原样；`percent_dense * extent` 的 clone/split 分界不变。
+- Perceptual-GS 自身的 sparse 判定、每 5k 重初始化分支、HD/MD 提前更新及评估顺序全部保留。1k/5k/10k 仍就地评估，最终保存发生在当轮 densification/重初始化之前；退出时的内存高斯数量可能不同于 10k 评估与保存状态。
+- 继续只保存最终 `point_cloud/iteration_10000/point_cloud.ply` 和 `sensitivity.ply`，不产生中间 PLY 或续训 checkpoint。已完成样本跳过；未完成样本清理其结果目录后从零重跑，共享 prepared 缓存保留。
+- `omniscene_training_trace.json` 记录每次 densification 的 opacity/screen/world 候选数、world-only 候选数、实际剪除数及里程碑高斯数量。原生 sparse 重初始化造成的剪枝跳过单独标记，不能误认为漏记。候选集合可能重叠，world-only 表示当前状态下旧规则会额外命中的高斯；3100 步之前 size gate 未生效时的候选数不代表实际删除数。
+- 诊断不增加渲染或中间模型保存，但剪枝计数可能引入同步开销，因此本次耗时不直接用于新旧速度比较。原 all-18/novel-12 汇总和 `--metrics-only` 继续可用；全量样本完成后才生成全量汇总。
 
 ## 9. 结果目录、完成态与汇总
 

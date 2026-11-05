@@ -460,7 +460,7 @@ class GaussianModel:
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_sensitivity, new_alpha)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, iteration, opt, no_hd, no_md, no_od, od_factor):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, iteration, opt, no_hd, no_md, no_od, od_factor, world_size_pruning=True, pruning_stats=None):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
@@ -468,11 +468,30 @@ class GaussianModel:
         self.densify_and_split(grads, max_grad, extent, iteration, opt, no_hd=no_hd, no_md=no_md)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
+        opacity_mask = prune_mask
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
-            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+            prune_mask = torch.logical_or(prune_mask, big_points_vs)
+            if world_size_pruning:
+                prune_mask = torch.logical_or(prune_mask, big_points_ws)
+        if pruning_stats is not None:
+            screen_mask = big_points_vs if max_screen_size else torch.zeros_like(opacity_mask)
+            world_mask = big_points_ws if max_screen_size else self.get_scaling.max(dim=1).values > 0.1 * extent
+            pruning_stats.update({
+                "points_before_prune": int(self.get_xyz.shape[0]),
+                "camera_extent": float(extent), "world_scale_threshold": float(0.1 * extent),
+                "opacity_candidates": int(opacity_mask.sum().item()),
+                "screen_candidates": int(screen_mask.sum().item()),
+                "world_candidates": int(world_mask.sum().item()),
+                "world_only_candidates": int((world_mask & ~(opacity_mask | screen_mask)).sum().item()),
+                "size_pruning_active": bool(max_screen_size),
+                "world_pruning_active": bool(max_screen_size) and world_size_pruning,
+                "pruned_total": int(prune_mask.sum().item()),
+            })
         self.prune_points(prune_mask)
+        if pruning_stats is not None:
+            pruning_stats["points_after_prune"] = int(self.get_xyz.shape[0])
 
         if iteration % opt.hd_interval == 0 or iteration % opt.md_interval == 0:
             self.trans[:] = 0

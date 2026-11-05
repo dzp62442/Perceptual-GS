@@ -10,6 +10,7 @@
 #
 
 import logging
+import hashlib
 import json
 import os
 import torch
@@ -31,6 +32,7 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 from time import perf_counter
 import torchvision
 from lpipsPyTorch.modules.lpips import LPIPS
+from comp_svfgs.pruning_experiment import EXPERIMENTS, experiment_spec, validate_training_experiment
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -38,7 +40,14 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, no_hd, no_md, edge_mode, no_sadr, no_ada_densification_strategy, all_dr, no_od, od_factor, full_eval_metrics=False):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, no_hd, no_md, edge_mode, no_sadr, no_ada_densification_strategy, all_dr, no_od, od_factor, full_eval_metrics=False, pruning_experiment=None):
+    if pruning_experiment:
+        if not full_eval_metrics or checkpoint or checkpoint_iterations or set(saving_iterations) != {opt.iterations}:
+            raise ValueError("Pruning exploration requires inline evaluation, final-only saves, and no checkpoints.")
+        validate_training_experiment(dataset.model_path, pruning_experiment, opt)
+    pruning_events = [] if pruning_experiment else None
+    milestone_counts = {}
+    view_sequence = hashlib.sha256() if pruning_experiment else None
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
@@ -101,6 +110,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        if view_sequence is not None:
+            view_sequence.update("{}:{}\n".format(iteration, viewpoint_cam.image_name).encode("utf-8"))
 
         # Render
         if (iteration - 1) == debug_from:
@@ -169,6 +180,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Log and save. Full OmniScene evaluation pauses the pure-training timer.
             is_full_evaluation = full_eval_metrics and iteration in testing_iterations
             if is_full_evaluation:
+                if pruning_experiment:
+                    milestone_counts[str(iteration)] = int(gaussians.get_xyz.shape[0])
                 torch.cuda.synchronize()
                 cumulative_training_time += perf_counter() - training_segment_start
             evaluation_result = training_report(
@@ -226,10 +239,16 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     if not no_hd and not no_md and gaussians.sparse and iteration % 5000 == 0:
-                        pass
+                        if pruning_events is not None:
+                            pruning_events.append({"iteration": iteration, "kind": "sparse_reinitialization", "world_pruning_active": False})
                     else:
                         size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                        gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, iteration, opt, no_hd, no_md, no_od, od_factor)
+                        pruning_stats = {"iteration": iteration, "kind": "prune"} if pruning_experiment else None
+                        gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, iteration, opt, no_hd, no_md, no_od, od_factor,
+                                                  world_size_pruning=pruning_experiment != "no-world-prune", pruning_stats=pruning_stats)
+                        if pruning_events is not None:
+                            pruning_events.append(pruning_stats)
+                            print("[PRUNING] " + json.dumps(pruning_stats), flush=True)
                 
                 if not no_hd and not no_md and gaussians.sparse and iteration%5000==0:
                     out_pts_list=[]
@@ -310,6 +329,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     torch.cuda.synchronize()
                     training_segment_start = perf_counter()
 
+    if pruning_experiment:
+        _atomic_write_json(os.path.join(scene.model_path, "omniscene_training_trace.json"), {
+            "pruning_experiment": experiment_spec(pruning_experiment, vars(opt)),
+            "iterations": opt.iterations, "pruning_events": pruning_events,
+            "view_sequence_sha256": view_sequence.hexdigest(),
+            "gaussian_count_at_milestones": milestone_counts,
+            "gaussian_count_after_loop": int(gaussians.get_xyz.shape[0]),
+        })
     print("**********************************")
     print("Scene:", dataset.source_path)
     print("Gaussians:", gaussians._xyz.shape[0])
@@ -550,6 +577,7 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--full_eval_metrics", action="store_true",
                         help="Save all test renders, metrics, and cumulative pure-training time")
+    parser.add_argument("--pruning_experiment", choices=EXPERIMENTS, default=None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -561,7 +589,8 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.no_hd, args.no_md, args.edge_mode, args.no_sadr, args.no_ada_densification_strategy, args.all_dr, args.no_od, args.od_factor, full_eval_metrics=args.full_eval_metrics)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.no_hd, args.no_md, args.edge_mode, args.no_sadr, args.no_ada_densification_strategy, args.all_dr, args.no_od, args.od_factor,
+             full_eval_metrics=args.full_eval_metrics, pruning_experiment=args.pruning_experiment)
 
     # All done
     print("\nTraining complete.")

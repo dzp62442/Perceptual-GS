@@ -32,6 +32,11 @@ from comp_svfgs.omniscene_preprocess import (  # noqa: E402
     prepared_scene_complete,
     preprocess_scene,
 )
+from arguments import OptimizationParams  # noqa: E402
+from comp_svfgs.pruning_experiment import (  # noqa: E402
+    EXPERIMENTS, experiment_spec, expected_pruning_steps, resolve_result_root,
+    validate_output_children, validate_pruning_trace,
+)
 
 
 DEFAULT_ITERATIONS = 10000
@@ -51,7 +56,7 @@ RESERVED_EXTRA_ARGS = {
     "-s", "--source_path", "-m", "--model_path", "-r", "--resolution",
     "--eval", "--iterations", "--test_iterations", "--save_iterations",
     "--checkpoint_iterations", "--start_checkpoint", "--full_eval_metrics",
-    "--edge_mode",
+    "--edge_mode", "--pruning_experiment",
 }
 
 
@@ -303,6 +308,7 @@ def _scene_marker_matches(
     resolution: Tuple[int, int],
     iterations: int,
     eval_iterations: Sequence[int],
+    pruning_experiment: Optional[Dict] = None,
 ) -> bool:
     try:
         marker = json.loads(marker_path.read_text(encoding="utf-8"))
@@ -315,6 +321,7 @@ def _scene_marker_matches(
             and marker.get("resolution") == list(resolution)
             and marker.get("iterations") == int(iterations)
             and marker.get("eval_iterations") == list(eval_iterations)
+            and marker.get("pruning_experiment") == pruning_experiment
         )
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return False
@@ -331,6 +338,7 @@ def scene_outputs_complete(
     data_root: os.PathLike,
     iterations: int,
     eval_iterations: Sequence[int],
+    pruning_experiment: Optional[Dict] = None,
 ) -> bool:
     if not prepared_scene_complete(
         prepared_scene,
@@ -355,6 +363,18 @@ def scene_outputs_complete(
         return False
     if list(model_path.glob("chkpnt*.pth")):
         return False
+    if pruning_experiment:
+        try:
+            if json.loads((model_path / "pruning_experiment.json").read_text()) != pruning_experiment:
+                return False
+            if any(path.name != "iteration_{}".format(iterations) for path in (model_path / "point_cloud").glob("iteration_*")):
+                return False
+            trace = json.loads((model_path / "omniscene_training_trace.json").read_text())
+            validate_pruning_trace(trace, pruning_experiment, iterations, eval_iterations)
+            for iteration in eval_iterations:
+                read_iteration_view_metrics(model_path, prepared_scene, iteration)
+        except (OSError, KeyError, TypeError, ValueError):
+            return False
     try:
         training_times = [
             parse_training_time(model_path / "training_time_{}.txt".format(iteration))
@@ -377,15 +397,16 @@ def scene_complete(
     data_root: os.PathLike,
     iterations: int,
     eval_iterations: Sequence[int],
+    pruning_experiment: Optional[Dict] = None,
 ) -> bool:
     if not scene_outputs_complete(
         model_path, prepared_scene, bin_token, resolution, confidence_threshold,
-        mode, scene_index, data_root, iterations, eval_iterations,
+        mode, scene_index, data_root, iterations, eval_iterations, pruning_experiment,
     ):
         return False
     return _scene_marker_matches(
         model_path / "scene_complete.json", mode, scene_name, bin_token,
-        resolution, iterations, eval_iterations,
+        resolution, iterations, eval_iterations, pruning_experiment,
     )
 
 
@@ -396,7 +417,10 @@ def _validate_extra_train_args(parser: argparse.ArgumentParser, extra_args: Sequ
             option.startswith(short_option) and option != short_option
             for short_option in ("-s", "-m", "-r")
         )
-        if option in RESERVED_EXTRA_ARGS or attached_reserved_short:
+        reserved_abbreviation = option.startswith("--") and any(
+            name.startswith(option) for name in RESERVED_EXTRA_ARGS if name.startswith("--")
+        )
+        if option in RESERVED_EXTRA_ARGS or attached_reserved_short or reserved_abbreviation:
             parser.error(
                 "{} is managed by run_omniscene.py and cannot appear in --extra-train-args".format(
                     option
@@ -411,6 +435,7 @@ def build_train_command(
     iterations: int,
     eval_iterations: Sequence[int],
     extra_train_args: Sequence[str],
+    pruning_experiment: Optional[Dict] = None,
 ) -> List[str]:
     command = [
         python_executable,
@@ -425,6 +450,8 @@ def build_train_command(
         "--full_eval_metrics",
     ]
     command.extend(extra_train_args)
+    if pruning_experiment:
+        command.extend(["--pruning_experiment", pruning_experiment["name"]])
     return command
 
 
@@ -443,6 +470,7 @@ def _write_scene_completion(
     resolution: Tuple[int, int],
     iterations: int,
     eval_iterations: Sequence[int],
+    pruning_experiment: Optional[Dict] = None,
 ) -> None:
     metrics = {}
     for iteration in eval_iterations:
@@ -468,6 +496,7 @@ def _write_scene_completion(
             "iterations": int(iterations),
             "eval_iterations": list(eval_iterations),
             "metrics": metrics,
+            **({"pruning_experiment": pruning_experiment} if pruning_experiment else {}),
             "completed_at": datetime.now(timezone.utc).isoformat(),
         },
     )
@@ -491,6 +520,7 @@ def run_scene(
     iterations: int,
     eval_iterations: Sequence[int],
     extra_train_args: Sequence[str],
+    pruning_experiment: Optional[Dict] = None,
 ) -> Tuple[str, str, Path, Path]:
     scene_index = dataset_index + 1
     scene_name = dataset.scene_name(dataset_index)
@@ -498,13 +528,16 @@ def run_scene(
     prepared_scene = prepared_root / scene_name
     model_path = experiment_root / scene_name
     record = scene_name, bin_token, prepared_scene, model_path
+    if pruning_experiment:
+        validate_output_children(experiment_root, [scene_name], dataset.mode)
+        _require_prepared_scene(dataset, dataset_index, prepared_root, confidence_threshold)
 
     # This check deliberately does not inspect source hashes, Git commit/branch,
     # or clean/dirty state. Durable artifacts and semantic protocol are enough.
     if scene_complete(
         model_path, prepared_scene, scene_name, bin_token, dataset.resolution,
         confidence_threshold, dataset.mode, scene_index, dataset.data_root,
-        iterations, eval_iterations,
+        iterations, eval_iterations, pruning_experiment,
     ):
         print("[SKIP] Completed scene: {}".format(scene_name), flush=True)
         write_scene_view_metrics_summary(
@@ -512,16 +545,13 @@ def run_scene(
         )
         return record
 
-    scene_data = dataset[dataset_index]
-    prepared_scene = preprocess_scene(
-        scene_data=scene_data,
-        output_root=prepared_root,
-        scene_name=scene_name,
-        scene_index=scene_index,
-        mode=dataset.mode,
-        data_root=dataset.data_root,
-        confidence_threshold=confidence_threshold,
-    )
+    if not pruning_experiment:
+        scene_data = dataset[dataset_index]
+        prepared_scene = preprocess_scene(
+            scene_data=scene_data, output_root=prepared_root, scene_name=scene_name,
+            scene_index=scene_index, mode=dataset.mode, data_root=dataset.data_root,
+            confidence_threshold=confidence_threshold,
+        )
     record = scene_name, bin_token, prepared_scene, model_path
 
     if model_path.exists():
@@ -530,10 +560,12 @@ def run_scene(
     else:
         print("[START] Training from zero: {}".format(scene_name), flush=True)
     model_path.mkdir(parents=True, exist_ok=False)
+    if pruning_experiment:
+        _atomic_write_json(model_path / "pruning_experiment.json", pruning_experiment)
 
     command = build_train_command(
         sys.executable, prepared_scene, model_path, iterations,
-        eval_iterations, extra_train_args,
+        eval_iterations, extra_train_args, pruning_experiment,
     )
     _atomic_write_json(model_path / "runner_command.json", {"command": command})
     _run_command(command, gpu)
@@ -541,17 +573,17 @@ def run_scene(
     if not scene_outputs_complete(
         model_path, prepared_scene, bin_token, dataset.resolution,
         confidence_threshold, dataset.mode, scene_index, dataset.data_root,
-        iterations, eval_iterations,
+        iterations, eval_iterations, pruning_experiment,
     ):
         raise RuntimeError("Scene did not produce all required artifacts: {}".format(scene_name))
     _write_scene_completion(
         model_path, dataset.mode, scene_name, bin_token, dataset.resolution,
-        iterations, eval_iterations,
+        iterations, eval_iterations, pruning_experiment,
     )
     if not scene_complete(
         model_path, prepared_scene, scene_name, bin_token, dataset.resolution,
         confidence_threshold, dataset.mode, scene_index, dataset.data_root,
-        iterations, eval_iterations,
+        iterations, eval_iterations, pruning_experiment,
     ):
         raise RuntimeError("Scene completion marker failed validation: {}".format(scene_name))
     write_scene_view_metrics_summary(
@@ -569,6 +601,7 @@ def collect_completed_scene_metrics(
     confidence_threshold: float,
     iterations: int,
     eval_iterations: Sequence[int],
+    pruning_experiment: Optional[Dict] = None,
 ) -> Tuple[str, str, Path, Path]:
     """Backfill derived metrics without preprocessing, training, or rendering."""
     scene_index = dataset_index + 1
@@ -579,7 +612,7 @@ def collect_completed_scene_metrics(
     if not scene_complete(
         model_path, prepared_scene, scene_name, bin_token, dataset.resolution,
         confidence_threshold, dataset.mode, scene_index, dataset.data_root,
-        iterations, eval_iterations,
+        iterations, eval_iterations, pruning_experiment,
     ):
         raise RuntimeError(
             "Metrics-only mode found an incomplete scene and will not start training: {}".format(
@@ -619,7 +652,7 @@ def aggregate_results(
             model_path, prepared_scene, scene_name, bin_token,
             tuple(protocol["resolution"]), protocol["confidence_threshold"],
             protocol["split"], scene_index, protocol["data_root"],
-            protocol["iterations"], eval_iterations,
+            protocol["iterations"], eval_iterations, protocol.get("pruning_experiment"),
         ):
             raise RuntimeError("Cannot aggregate incomplete scene: {}".format(scene_name))
         scene_summary = write_scene_view_metrics_summary(
@@ -683,6 +716,7 @@ def aggregate_results(
         "iterations": protocol["iterations"],
         "eval_iterations": protocol["eval_iterations"],
         "extra_train_args": protocol["extra_train_args"],
+        **({"pruning_experiment": protocol["pruning_experiment"]} if protocol.get("pruning_experiment") else {}),
         "view_groups": {
             ALL_VIEW_GROUP: {
                 "num_views_per_sample": TARGET_VIEW_COUNT,
@@ -752,7 +786,7 @@ def _prepared_tag(mode: str, resolution: Tuple[int, int], confidence_threshold: 
     return tag
 
 
-def ensure_protocol(experiment_root: Path, protocol: Dict) -> None:
+def ensure_protocol(experiment_root: Path, protocol: Dict, dry_run: bool = False) -> None:
     protocol_path = experiment_root / "{}_protocol.json".format(protocol["split"])
     if protocol_path.is_file():
         existing = json.loads(protocol_path.read_text(encoding="utf-8"))
@@ -761,14 +795,22 @@ def ensure_protocol(experiment_root: Path, protocol: Dict) -> None:
                 "Result directory contains a different semantic protocol: {}".format(protocol_path)
             )
         return
-    existing_entries = list(experiment_root.iterdir())
+    existing_entries = list(experiment_root.iterdir()) if experiment_root.exists() else []
     if existing_entries:
         raise RuntimeError(
             "Refusing to adopt a non-empty result directory without a protocol file: {}".format(
                 experiment_root
             )
         )
-    _atomic_write_json(protocol_path, protocol)
+    if not dry_run:
+        _atomic_write_json(protocol_path, protocol)
+
+
+def _require_prepared_scene(dataset, dataset_index: int, prepared_root: Path, confidence_threshold: float) -> None:
+    name = dataset.scene_name(dataset_index)
+    if not prepared_scene_complete(prepared_root / name, dataset.bin_tokens[dataset_index], dataset.resolution,
+                                   confidence_threshold, mode=dataset.mode, data_root=dataset.data_root, scene_index=dataset_index + 1):
+        raise RuntimeError("Missing or incompatible prepared cache; exploration never rebuilds it: {}".format(prepared_root / name))
 
 
 def _all_scene_records(dataset: OmniSceneDataset, prepared_root: Path, experiment_root: Path):
@@ -783,14 +825,17 @@ def _all_scene_records(dataset: OmniSceneDataset, prepared_root: Path, experimen
     ]
 
 
-def main() -> None:
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="OmniScene per-bin preprocessing, optimization, evaluation, and aggregation",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--data-root", default="datasets/omniscene")
     parser.add_argument("--prepared-root", default="output/omniscene_prepared")
-    parser.add_argument("--result-root", default="output/omniscene_results")
+    parser.add_argument("--result-root", default=None, help="Result root; defaults depend on --experiment")
+    parser.add_argument("--experiment", choices=EXPERIMENTS, default=None,
+                        help="Optional pruning exploration in an independent result directory")
+    parser.add_argument("--dry-run", action="store_true", help="Read-only cache checks and command preview; no training or writes")
     parser.add_argument(
         "--mode", choices=("train", "val", "test", "demo", "center150"),
         default="center150",
@@ -819,7 +864,7 @@ def main() -> None:
         "--extra-train-args", nargs=argparse.REMAINDER, default=[],
         help="Arguments passed through to train.py; this option must appear last",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.n_views != TRAIN_VIEW_COUNT:
         parser.error("--n-views is fixed to 6 for this protocol")
@@ -837,10 +882,17 @@ def main() -> None:
     if eval_iterations[-1] != args.iterations:
         parser.error("The final --eval-iterations value must equal --iterations")
     _validate_extra_train_args(parser, args.extra_train_args)
+    return args
+
+
+def main() -> None:
+    args = parse_args()
+    eval_iterations = tuple(args.eval_iterations)
 
     data_root = _absolute_path(args.data_root)
     prepared_base = _absolute_path(args.prepared_root)
-    result_base = _absolute_path(args.result_root)
+    result_base = resolve_result_root(_absolute_path(args.result_root) if args.result_root else None,
+                                      prepared_base, data_root, args.experiment, REPO_ROOT)
     dataset = OmniSceneDataset(data_root, mode=args.mode, resolution=args.resolution)
     prepared_root = prepared_base / _prepared_tag(
         args.mode, args.resolution, args.conf_threshold
@@ -849,8 +901,9 @@ def main() -> None:
         args.mode, args.resolution, args.conf_threshold, args.iterations,
         eval_iterations, args.extra_train_args,
     )
-    prepared_root.mkdir(parents=True, exist_ok=True)
-    experiment_root.mkdir(parents=True, exist_ok=True)
+    if args.experiment:
+        resolve_result_root(experiment_root, prepared_base, data_root, args.experiment, REPO_ROOT)
+        validate_output_children(experiment_root, [dataset.scene_name(i) for i in range(len(dataset))], dataset.mode)
 
     protocol = {
         "protocol_version": PROTOCOL_VERSION,
@@ -864,28 +917,61 @@ def main() -> None:
         "eval_iterations": list(eval_iterations),
         "extra_train_args": list(args.extra_train_args),
     }
-    ensure_protocol(experiment_root, protocol)
+    pruning_experiment = None
+    if args.experiment:
+        optimization_parser = argparse.ArgumentParser(add_help=False)
+        optimization_params = OptimizationParams(optimization_parser)
+        optimization_args, _ = optimization_parser.parse_known_args(args.extra_train_args)
+        pruning_experiment = experiment_spec(args.experiment, vars(optimization_params.extract(optimization_args)))
+        expected_pruning_steps(pruning_experiment, args.iterations)
+        protocol["pruning_experiment"] = pruning_experiment
 
     if args.scene_indices is None:
         selected_indices = list(range(len(dataset)))
     else:
         if len(set(args.scene_indices)) != len(args.scene_indices):
-            parser.error("--scene-indices cannot contain duplicates")
+            raise ValueError("--scene-indices cannot contain duplicates")
         if any(value < 1 or value > len(dataset) for value in args.scene_indices):
-            parser.error("--scene-indices values must be in [1, {}]".format(len(dataset)))
+            raise ValueError("--scene-indices values must be in [1, {}]".format(len(dataset)))
         selected_indices = [value - 1 for value in args.scene_indices]
+
+    if args.experiment or args.dry_run:
+        for index in selected_indices:
+            _require_prepared_scene(dataset, index, prepared_root, args.conf_threshold)
+    if not args.dry_run:
+        if not args.experiment:
+            prepared_root.mkdir(parents=True, exist_ok=True)
+        experiment_root.mkdir(parents=True, exist_ok=True)
+    ensure_protocol(experiment_root, protocol, dry_run=args.dry_run)
+
+    if args.dry_run:
+        print("[DRY-RUN] results: {}\n[DRY-RUN] cache: {}".format(experiment_root, prepared_root))
+        for index in selected_indices:
+            name, token = dataset.scene_name(index), dataset.bin_tokens[index]
+            prepared, result = prepared_root / name, experiment_root / name
+            if scene_complete(result, prepared, name, token, dataset.resolution, args.conf_threshold,
+                              dataset.mode, index + 1, data_root, args.iterations, eval_iterations, pruning_experiment):
+                print("[DRY-RUN SKIP] {}: complete".format(name))
+            elif args.metrics_only:
+                raise RuntimeError("Metrics-only mode found an incomplete scene: {}".format(name))
+            else:
+                command = build_train_command(sys.executable, prepared, result, args.iterations,
+                                              eval_iterations, args.extra_train_args, pruning_experiment)
+                print("[DRY-RUN {}] {}".format("RESTART" if result.exists() else "START", name))
+                print(" ".join(shlex.quote(value) for value in command))
+        return
 
     for dataset_index in selected_indices:
         if args.metrics_only:
             collect_completed_scene_metrics(
                 dataset, dataset_index, prepared_root, experiment_root,
-                args.conf_threshold, args.iterations, eval_iterations,
+                args.conf_threshold, args.iterations, eval_iterations, pruning_experiment,
             )
         else:
             run_scene(
                 dataset, dataset_index, prepared_root, experiment_root,
                 args.conf_threshold, args.gpu, args.iterations, eval_iterations,
-                args.extra_train_args,
+                args.extra_train_args, pruning_experiment,
             )
 
     all_records = _all_scene_records(dataset, prepared_root, experiment_root)
@@ -893,7 +979,7 @@ def main() -> None:
         scene_complete(
             model_path, prepared_scene, scene_name, bin_token, dataset.resolution,
             args.conf_threshold, dataset.mode, index, dataset.data_root,
-            args.iterations, eval_iterations,
+            args.iterations, eval_iterations, pruning_experiment,
         )
         for index, (scene_name, bin_token, prepared_scene, model_path) in enumerate(
             all_records, 1
